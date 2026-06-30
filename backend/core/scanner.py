@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 
 from core.vulnerability import VulnerabilityModule
+from core.payloads import PayloadManager
 
 
 class ScanError(Exception):
@@ -16,18 +19,18 @@ class ScanError(Exception):
 
 
 class SecurityScanner:
-    """Async security scanning engine.
+    """Async security scanning engine with basic crawling, module orchestration,
+    proxy rotation integration, fingerprinting and payload support.
 
-    Responsibilities:
-    - Validate config (via ScannerConfig if provided)
-    - Manage concurrency and sessions (aiohttp)
-    - Rotate proxies and fingerprints
-    - Run VulnerabilityModule instances concurrently and collect findings
-    - Provide simple WAF-evasion helpers (header shuffling, retries, payload variants)
+    Modules should be instances of VulnerabilityModule and may use the
+    provided `context['request']` helper to perform requests with retries,
+    fingerprint headers and optional payload variants supplied by PayloadManager.
     """
 
+    URL_EXTRACT_RE = re.compile(r"href=[\"']([^\"'#]+)[\"']", re.IGNORECASE)
+
     def __init__(self, config: Dict[str, Any], logger: Optional[logging.Logger] = None):
-        # Lazy import of heavy config class to avoid hard dependency during import-time
+        # lazy import ScannerConfig for validation
         try:
             from core.config_models import ScannerConfig  # type: ignore
         except Exception:
@@ -35,10 +38,8 @@ class SecurityScanner:
 
         if ScannerConfig is not None and not isinstance(config, ScannerConfig):
             try:
-                # If the user passed a dict, validate it
                 self.config = ScannerConfig.model_validate(config)  # type: ignore
             except Exception:
-                # If validation fails or ScannerConfig unavailable, fall back to raw dict
                 self.config = config
         else:
             self.config = config
@@ -49,34 +50,33 @@ class SecurityScanner:
         self.start_time: Optional[datetime] = None
         self.end_time: Optional[datetime] = None
 
-        # Proxy manager and fingerprint are not mandatory for basic runs; attempt import
+        # Build helpers if available
         try:
             from core.proxy_manager import ProxyManager  # type: ignore
             from core.fingerprint import RequestFingerprinter  # type: ignore
-
-            self.proxy_mgr = ProxyManager(getattr(self.config, "proxies", None))
-            self.fingerprint = RequestFingerprinter(getattr(self.config, "user_agents", None))
         except Exception:
-            self.proxy_mgr = None
-            self.fingerprint = None
+            ProxyManager = None  # type: ignore
+            RequestFingerprinter = None  # type: ignore
 
-        # Concurrency control: default to 10 if not present in validated config
+        self.proxy_mgr = ProxyManager(getattr(self.config, "proxies", None)) if ProxyManager else None
+        self.fingerprinter = (
+            RequestFingerprinter(getattr(self.config, "user_agents", None), getattr(self.config, "fingerprint_aggressiveness", "low"))
+            if RequestFingerprinter
+            else None
+        )
+        self.payload_mgr = PayloadManager(getattr(self.config, "fingerprint_aggressiveness", "low"))
+
+        # Concurrency and timeouts
         self._concurrency = int(getattr(self.config, "concurrency", 10))
         self._semaphore = asyncio.Semaphore(self._concurrency)
-
-        # aiohttp connector limits
         self._connector_limit = int(getattr(self.config, "concurrency", 10))
-
-        # retry policy
         self._retries = int(getattr(self.config, "retries", 2))
         self._timeout_seconds = int(getattr(self.config, "timeout_seconds", 15))
 
-    async def _make_session(self, proxy: Optional[str] = None) -> aiohttp.ClientSession:
+    async def _make_session(self) -> aiohttp.ClientSession:
         timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
-        connector = aiohttp.TCPConnector(limit_per_host=self._connector_limit, ssl=False)
-        session = aiohttp.ClientSession(timeout=timeout, connector=connector)
-        # Note: headers will be applied per-request using fingerprint.generate_headers()
-        return session
+        connector = aiohttp.TCPConnector(limit_per_host=self._connector_limit)
+        return aiohttp.ClientSession(timeout=timeout, connector=connector)
 
     async def _request_with_retries(
         self,
@@ -87,8 +87,12 @@ class SecurityScanner:
         headers: Optional[Dict[str, str]] = None,
         proxy: Optional[str] = None,
         data: Optional[Any] = None,
-    ) -> aiohttp.ClientResponse:
-        """Perform an HTTP request with simple retry logic and jitter."""
+    ) -> Dict[str, Any]:
+        """Make a request with retries and return a small result dict.
+
+        Note: we return the response status and a short text snippet (first 2048 chars)
+        to be used as evidence by vulnerability modules.
+        """
         last_exc: Optional[Exception] = None
         for attempt in range(self._retries + 1):
             try:
@@ -100,72 +104,177 @@ class SecurityScanner:
                 if proxy:
                     kwargs["proxy"] = proxy
 
-                # Use aiohttp request API (method lowercased)
                 async with session.request(method.upper(), url, **kwargs) as resp:
-                    # Treat 429 and 5xx as retryable
-                    if resp.status == 429 or 500 <= resp.status < 600:
-                        last_exc = ScanError(f"Retryable status: {resp.status}")
-                        raise last_exc
-                    return resp
-            except Exception as exc:
+                    text = ""
+                    try:
+                        text = await resp.text()
+                    except Exception:
+                        text = "<non-text response>"
+                    snippet = text[:2048]
+                    return {"status": resp.status, "text": text, "snippet": snippet, "url": str(resp.url)}
+
+            except Exception as exc:  # retryable network error
                 last_exc = exc
                 backoff = (2 ** attempt) + random.random()
-                self.logger.debug("Request attempt %d failed, sleeping %.2fs: %s", attempt, backoff, exc)
+                self.logger.debug("request attempt %d failed for %s, sleeping %.2fs: %s", attempt, url, backoff, exc)
+                # If proxy manager present, report failure to influence rotation
+                if getattr(self, "proxy_mgr", None) is not None and proxy:
+                    try:
+                        # best-effort: report failure if manager supports it
+                        report = getattr(self.proxy_mgr, "report_failure", None)
+                        if callable(report):
+                            report(proxy)
+                    except Exception:
+                        pass
                 await asyncio.sleep(backoff)
-        # If we get here, all retries failed
         raise ScanError(f"All retries failed for {url}; last error: {last_exc}")
 
-    async def _run_module_on_target(self, module: VulnerabilityModule, target: str, context: Dict[str, Any]) -> None:
-        """Execute a single module against a target using concurrency control."""
-        async with self._semaphore:
-            proxy = None
-            if getattr(self, "proxy_mgr", None) is not None:
-                proxy = self.proxy_mgr.pick()
+    def _extract_links(self, base_url: str, html_text: str) -> Set[str]:
+        found: Set[str] = set()
+        for m in self.URL_EXTRACT_RE.finditer(html_text):
+            href = m.group(1)
+            # normalize and only include same-host links
+            joined = urljoin(base_url, href)
+            p_base = urlparse(base_url)
+            p_join = urlparse(joined)
+            if p_base.netloc == p_join.netloc:
+                # strip fragments
+                cleaned = joined.split("#")[0]
+                found.add(cleaned)
+        return found
 
-            session = await self._make_session(proxy=proxy)
-            # Provide client-helpers to the module via context if needed
-            # The module should use session + helper functions to make requests
+    async def _crawl(self, root: str, max_depth: int = 1) -> List[str]:
+        # very small crawler: BFS up to max_depth, same-domain only
+        to_visit = {root}
+        visited: Set[str] = set()
+        results: List[str] = []
+        session = await self._make_session()
+        try:
+            for depth in range(max_depth):
+                if not to_visit:
+                    break
+                next_round: Set[str] = set()
+                for url in list(to_visit):
+                    if url in visited:
+                        continue
+                    try:
+                        headers = self.fingerprinter.generate_headers() if self.fingerprinter else None
+                        proxy = self.proxy_mgr.pick() if self.proxy_mgr else None
+                        res = await self._request_with_retries(session, "GET", url, headers=headers, proxy=proxy)
+                        visited.add(url)
+                        results.append(url)
+                        links = self._extract_links(url, res.get("text", ""))
+                        next_round.update(links - visited)
+                    except Exception as exc:
+                        self.logger.debug("Crawler error for %s: %s", url, exc)
+                        visited.add(url)
+                to_visit = next_round
+        finally:
+            await session.close()
+        return results
+
+    async def _run_module_on_target(self, module: VulnerabilityModule, target: str, context: Dict[str, Any]) -> None:
+        """Run a single module against a target and store findings with evidence."""
+        async with self._semaphore:
+            session = await self._make_session()
+            # Build helper request function for modules
+            async def request(
+                method: str,
+                url: str,
+                *,
+                headers: Optional[Dict[str, str]] = None,
+                payload: Optional[str] = None,
+                try_variants: bool = True,
+            ) -> Dict[str, Any]:
+                # choose proxy and headers for this request
+                proxy = self.proxy_mgr.pick() if getattr(self, "proxy_mgr", None) else None
+                if self.fingerprinter:
+                    hdrs = self.fingerprinter.generate_headers(headers)
+                else:
+                    hdrs = headers
+
+                # If payload provided and we should try variants, iterate variants from payload manager
+                if payload and try_variants:
+                    variants = self.payload_mgr.take(payload, limit=20)
+                    for variant in variants:
+                        # mutate headers slightly between attempts if aggressive
+                        if self.fingerprinter and getattr(self.fingerprinter, "aggressiveness", "low") in ("high", "aggressive"):
+                            hdrs = self.fingerprinter.generate_headers(headers)
+                        try:
+                            return await self._request_with_retries(session, method, url, headers=hdrs, proxy=proxy, data=variant)
+                        except Exception:
+                            # report failures to proxy manager if available and try next variant
+                            if getattr(self, "proxy_mgr", None) is not None and proxy:
+                                report = getattr(self.proxy_mgr, "report_failure", None)
+                                if callable(report):
+                                    report(proxy)
+                            continue
+                    # last attempt without variant
+                    return await self._request_with_retries(session, method, url, headers=hdrs, proxy=proxy, data=payload)
+                else:
+                    return await self._request_with_retries(session, method, url, headers=hdrs, proxy=proxy, data=payload)
+
+            # expose helpers to module via context
+            module_context = dict(context)
+            module_context.update({"request": request, "payloads": self.payload_mgr, "fingerprinter": self.fingerprinter})
+
             try:
-                findings = await module.run(target, session, context)
+                findings = await module.run(target, session, module_context)
+                # Normalize findings and attach evidence if missing
                 if findings:
-                    self.results.setdefault(module.name, []).extend(findings)
+                    normalized = []
+                    for f in findings:
+                        if "evidence" not in f:
+                            f["evidence"] = None
+                        if "payload" not in f:
+                            f["payload"] = None
+                        if "proxy" not in f and getattr(self, "proxy_mgr", None):
+                            f["proxy"] = None
+                        normalized.append(f)
+                    self.results.setdefault(module.name, []).extend(normalized)
             except Exception as exc:
-                self.logger.exception("Module %s error on %s: %s", getattr(module, "name", module.__class__.__name__), target, exc)
+                self.logger.exception("Module %s failed against %s: %s", getattr(module, "name", module.__class__.__name__), target, exc)
             finally:
                 await session.close()
 
     async def scan(self, target: str, modules: List[VulnerabilityModule], depth: int = 1) -> Dict[str, Any]:
-        """High-level scan orchestration.
-
-        Behavior:
-        - warms up proxy health checks (if proxy manager present)
-        - constructs a per-scan context including fingerprinter and config snapshot
-        - schedules module tasks concurrently using a semaphore
-        - returns structured results including scan id and duration
-        """
+        """Orchestrate crawling and module execution across discovered URLs."""
         self.start_time = datetime.utcnow()
         self.scan_id = self._generate_scan_id()
-        self.logger.info("Starting scan %s target=%s modules=%d", self.scan_id, target, len(modules))
+        self.logger.info("Starting scan %s on %s", self.scan_id, target)
 
-        # If proxy manager exists, ensure health checks happen
+        # warm-up proxy health checks
         if getattr(self, "proxy_mgr", None) is not None:
             try:
                 await self.proxy_mgr.ensure_health()
             except Exception:
-                self.logger.debug("Proxy health check failed or not available; continuing without blocking")
+                self.logger.debug("Proxy health check failed; continuing")
+
+        # Crawl targets (root + discovered) up to configured depth
+        max_depth = int(getattr(self.config, "max_depth", depth))
+        try:
+            urls = await self._crawl(target, max_depth)
+            # always include root
+            if target not in urls:
+                urls.insert(0, target)
+        except Exception:
+            self.logger.debug("Crawl failed, falling back to single target")
+            urls = [target]
 
         context: Dict[str, Any] = {
             "scan_id": self.scan_id,
             "target": target,
-            "depth": depth,
             "config": getattr(self.config, "model_dump", lambda: dict(self.config))(),
-            "fingerprinter": self.fingerprint,
+            "fingerprinter": self.fingerprinter,
             "proxy_manager": self.proxy_mgr,
             "logger": self.logger,
         }
 
-        # Simple crawl/dispatch: run each module against the root target.
-        tasks = [asyncio.create_task(self._run_module_on_target(mod, target, context)) for mod in modules]
+        tasks: List[asyncio.Task] = []
+        for module in modules:
+            for url in urls:
+                tasks.append(asyncio.create_task(self._run_module_on_target(module, url, context)))
+
         await asyncio.gather(*tasks)
 
         self.end_time = datetime.utcnow()
@@ -179,7 +288,6 @@ class SecurityScanner:
         return str(uuid.uuid4())[:8]
 
     async def generate_report(self, fmt: str = "html", output_path: Optional[str] = None) -> None:
-        """Asynchronous placeholder for report generation (I/O heavy)."""
         self.logger.info("Generating report fmt=%s output=%s", fmt, output_path)
-        # Real implementation would render templates and write files
+        # minimal report: write JSON or HTML later
         return
