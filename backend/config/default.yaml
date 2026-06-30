@@ -1,0 +1,162 @@
+# AegisRecon Pro - Default Configuration
+# Copy to config/local.yaml and customize for your environment
+
+app:
+  name: "AegisRecon Pro"
+  version: "1.0.0"
+  debug: false
+  host: "127.0.0.1"
+  port: 5000
+  secret_key: "change-me-in-production"
+
+database:
+  # Options: "sqlite" or "postgresql"
+  type: "sqlite"
+  # SQLite
+  sqlite_path: "data/scans.db"
+  # PostgreSQL
+  postgresql:
+    host: "localhost"
+    port: 5432
+    user: "aegisrecon"
+    password: "change-me"
+    database: "aegisrecon_db"
+
+scanner:
+  # Maximum concurrent requests
+  max_concurrent_requests: 10
+  # Request timeout in seconds
+  request_timeout: 30
+  # Number of retries for failed requests
+  retry_attempts: 3
+  # Delay between requests in seconds
+  delay_between_requests: 1.0
+  # User agent rotation
+  rotate_user_agents: true
+  # Proxy support
+  use_proxy: false
+  proxy_url: "http://127.0.0.1:8080"
+
+modules:
+  sqli:
+    enabled: true
+    techniques:
+      - "error_based"
+      - "blind_boolean"
+      - "time_based"
+      - "union_based"
+      - "stacked_queries"
+      - "out_of_band"
+    timeout: 15
+  
+  xss:
+    enabled: true
+    types:
+      - "reflected"
+      - "stored"
+      - "dom_based"
+    use_polyglots: true
+    timeout: 10
+  
+  cmdi:
+    enabled: true
+    techniques:
+      - "shell_execution"
+      - "command_injection"
+    timeout: 10
+  
+  ssrf:
+    enabled: true
+    timeout: 15
+  
+  lfi_rfi:
+    enabled: true
+    timeout: 10
+  
+  idor:
+    enabled: true
+    timeout: 10
+  
+  open_redirect:
+    enabled: true
+    timeout: 10
+  
+  auth_bypass:
+    enabled: true
+    timeout: 15
+
+crawling:
+  # Maximum crawl depth
+  max_depth: 5
+  # Follow external links
+  follow_external_links: false
+  # Respect robots.txt
+  respect_robots_txt: true
+  # Extract parameters from JavaScript
+  extract_js_params: true
+  # Parse sitemap.xml
+  parse_sitemap: true
+  # Exclude patterns (regex)
+  exclude_patterns:
+    - "\\.(jpg|png|gif|css|js|woff|woff2|ttf|eot)$"
+    - "^\/admin\/login"
+
+browser:
+  # Use headless browser for JS rendering
+  use_headless_browser: true
+  # Browser type: "chromium", "firefox", "webkit"
+  browser_type: "chromium"
+  # Wait for navigation timeout
+  navigation_timeout: 30000
+  # Wait for selector timeout
+  selector_timeout: 10000
+
+reporting:
+  # Report output directory
+  output_dir: "reports"
+  # Include screenshots in reports
+  include_screenshots: true
+  # Include PoC code
+  include_poc: true
+  # Default export format: "pdf", "html", "json", "markdown"
+  default_format: "pdf"
+  # Auto-generate timestamp in filename
+  auto_timestamp: true
+
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: "INFO"
+  # Log file path
+  file: "logs/aegisrecon.log"
+  # Maximum log file size (MB)
+  max_size: 100
+  # Number of backup logs to keep
+  backup_count: 5
+
+security:
+  # Require API key for all requests
+  require_api_key: true
+  # API keys (add your keys here)
+  api_keys:
+    - "your-api-key-here"
+  # CORS allowed origins
+  cors_origins:
+    - "http://localhost:3000"
+    - "http://127.0.0.1:3000"
+
+payloads:
+  # Payload database path
+  database_path: "payloads/"
+  # Use advanced/slow payloads
+  use_advanced_payloads: true
+  # Payload timeout
+  timeout: 30
+
+headless_browser:
+  # Use Playwright for JS rendering
+  enabled: true
+  # Browser launch arguments
+  launch_args:
+    - "--disable-gpu"
+    - "--no-sandbox"
+    - "--disable-dev-shm-usage"

